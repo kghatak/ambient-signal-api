@@ -220,7 +220,7 @@ def dashboard():
 </head>
 <body>
     <h1>Ambient Signal Dashboard</h1>
-    <p class="refresh-info">Auto-refreshes every 2 seconds</p>
+    <p class="refresh-info">Live updates every 500ms</p>
 
     <div class="stats-grid" id="stats-grid"></div>
 
@@ -251,7 +251,7 @@ def dashboard():
         async function fetchData() {
             try {
                 const [signalsRes, statsRes] = await Promise.all([
-                    fetch('/signals?limit=50'),
+                    fetch('/signals?limit=100'),
                     fetch('/signals/stats')
                 ]);
                 const signals = await signalsRes.json();
@@ -297,20 +297,21 @@ def dashboard():
         function updateChart(signals) {
             const ctx = document.getElementById('chart').getContext('2d');
 
-            // Group by signal type
+            // Group by signal type (keep chronological order)
             const grouped = {};
-            signals.reverse().forEach(s => {
+            [...signals].reverse().forEach(s => {
                 if (!grouped[s.signal_type]) grouped[s.signal_type] = [];
                 grouped[s.signal_type].push({ x: new Date(s.timestamp), y: s.value });
             });
 
             const datasets = Object.entries(grouped).map(([type, data], i) => ({
                 label: type,
-                data: data,
+                data: data.slice(-50),  // Last 50 points per signal type
                 borderColor: colors[i % colors.length],
                 backgroundColor: colors[i % colors.length] + '20',
                 tension: 0.3,
-                fill: false
+                fill: false,
+                pointRadius: 2
             }));
 
             if (chart) {
@@ -323,8 +324,14 @@ def dashboard():
                     options: {
                         responsive: true,
                         maintainAspectRatio: false,
+                        animation: { duration: 0 },
                         scales: {
-                            x: { type: 'timeseries', time: { unit: 'minute' }, grid: { color: '#334155' }, ticks: { color: '#94a3b8' } },
+                            x: {
+                                type: 'timeseries',
+                                time: { unit: 'second', displayFormats: { second: 'HH:mm:ss' } },
+                                grid: { color: '#334155' },
+                                ticks: { color: '#94a3b8', maxTicksLimit: 8 }
+                            },
                             y: { grid: { color: '#334155' }, ticks: { color: '#94a3b8' } }
                         },
                         plugins: { legend: { labels: { color: '#e2e8f0' } } }
@@ -333,9 +340,9 @@ def dashboard():
             }
         }
 
-        // Initial fetch and auto-refresh
+        // Initial fetch and auto-refresh every 500ms
         fetchData();
-        setInterval(fetchData, 2000);
+        setInterval(fetchData, 500);
     </script>
     <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns"></script>
 </body>
