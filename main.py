@@ -2,49 +2,52 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from typing import Optional
-import libsql_experimental as libsql
+import libsql_client
 import os
 from datetime import datetime
-from contextlib import contextmanager
 
 app = FastAPI(title="Ambient Signal API")
 
 # Turso database configuration
-TURSO_URL = os.getenv("TURSO_URL", "")
-TURSO_AUTH_TOKEN = os.getenv("TURSO_AUTH_TOKEN", "")
+TURSO_URL = os.getenv("TURSO_URL", "").strip()
+TURSO_AUTH_TOKEN = os.getenv("TURSO_AUTH_TOKEN", "").strip()
 
-# Convert libsql:// to https:// for sync_url
-SYNC_URL = TURSO_URL.replace("libsql://", "https://") if TURSO_URL else ""
+# Build the database URL with auth token
+DB_URL = f"{TURSO_URL}?authToken={TURSO_AUTH_TOKEN}" if TURSO_URL else ""
+
+# Global client
+db_client = None
 
 
-# Database connection manager
-@contextmanager
-def get_db():
-    conn = libsql.connect("ambient-signals", sync_url=SYNC_URL, auth_token=TURSO_AUTH_TOKEN)
-    conn.sync()
-    try:
-        yield conn
-    finally:
-        conn.close()
+def get_client():
+    global db_client
+    if db_client is None:
+        db_client = libsql_client.create_client_sync(url=TURSO_URL, auth_token=TURSO_AUTH_TOKEN)
+    return db_client
+
+
+def execute_sql(sql, args=None):
+    client = get_client()
+    if args:
+        return client.execute(sql, args)
+    return client.execute(sql)
 
 
 # Initialize database
 def init_db():
-    with get_db() as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS signals (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT NOT NULL,
-                device_id TEXT NOT NULL,
-                signal_type TEXT,
-                value REAL,
-                unit TEXT,
-                raw_data TEXT
-            )
-        """)
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_device_id ON signals(device_id)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_timestamp ON signals(timestamp)")
-        conn.commit()
+    execute_sql("""
+        CREATE TABLE IF NOT EXISTS signals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            device_id TEXT NOT NULL,
+            signal_type TEXT,
+            value REAL,
+            unit TEXT,
+            raw_data TEXT
+        )
+    """)
+    execute_sql("CREATE INDEX IF NOT EXISTS idx_device_id ON signals(device_id)")
+    execute_sql("CREATE INDEX IF NOT EXISTS idx_timestamp ON signals(timestamp)")
 
 
 # Pydantic models
@@ -83,15 +86,10 @@ def health():
 @app.post("/signal")
 def receive_single_signal(signal: SingleSignal):
     timestamp = datetime.utcnow().isoformat()
-
-    with get_db() as conn:
-        conn.execute(
-            """INSERT INTO signals (timestamp, device_id, signal_type, value, unit, raw_data)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (timestamp, signal.device_id, signal.signal_type, signal.value, signal.unit, None)
-        )
-        conn.commit()
-
+    execute_sql(
+        "INSERT INTO signals (timestamp, device_id, signal_type, value, unit, raw_data) VALUES (?, ?, ?, ?, ?, ?)",
+        [timestamp, signal.device_id, signal.signal_type, signal.value, signal.unit, None]
+    )
     return {"status": "ok", "received": 1, "timestamp": timestamp}
 
 
@@ -99,20 +97,14 @@ def receive_single_signal(signal: SingleSignal):
 @app.post("/signals/batch")
 def receive_batch_signals(batch: SignalBatch):
     server_timestamp = datetime.utcnow().isoformat()
-
-    with get_db() as conn:
-        inserted = 0
-        for reading in batch.readings:
-            # Use client timestamp if provided, otherwise server timestamp
-            ts = reading.timestamp or server_timestamp
-            conn.execute(
-                """INSERT INTO signals (timestamp, device_id, signal_type, value, unit, raw_data)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                (ts, batch.device_id, reading.signal_type, reading.value, reading.unit, None)
-            )
-            inserted += 1
-        conn.commit()
-
+    inserted = 0
+    for reading in batch.readings:
+        ts = reading.timestamp or server_timestamp
+        execute_sql(
+            "INSERT INTO signals (timestamp, device_id, signal_type, value, unit, raw_data) VALUES (?, ?, ?, ?, ?, ?)",
+            [ts, batch.device_id, reading.signal_type, reading.value, reading.unit, None]
+        )
+        inserted += 1
     return {
         "status": "ok",
         "received": inserted,
@@ -121,71 +113,62 @@ def receive_batch_signals(batch: SignalBatch):
     }
 
 
-# Helper to convert rows to dicts
-def rows_to_dicts(rows, columns):
-    return [dict(zip(columns, row)) for row in rows]
+# Helper to convert result set rows to dicts
+def result_to_dicts(result):
+    columns = [col[0] for col in result.columns]
+    return [dict(zip(columns, row)) for row in result.rows]
 
 
 # Get recent signals
 @app.get("/signals")
 def get_signals(device_id: Optional[str] = None, limit: int = 100):
-    columns = ["id", "timestamp", "device_id", "signal_type", "value", "unit", "raw_data"]
-    with get_db() as conn:
-        if device_id:
-            rows = conn.execute(
-                "SELECT * FROM signals WHERE device_id = ? ORDER BY id DESC LIMIT ?",
-                (device_id, limit)
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                "SELECT * FROM signals ORDER BY id DESC LIMIT ?",
-                (limit,)
-            ).fetchall()
-
-    return {
-        "count": len(rows),
-        "signals": rows_to_dicts(rows, columns)
-    }
+    if device_id:
+        result = execute_sql(
+            "SELECT * FROM signals WHERE device_id = ? ORDER BY id DESC LIMIT ?",
+            [device_id, limit]
+        )
+    else:
+        result = execute_sql(
+            "SELECT * FROM signals ORDER BY id DESC LIMIT ?",
+            [limit]
+        )
+    signals = result_to_dicts(result)
+    return {"count": len(signals), "signals": signals}
 
 
 # Get signal stats (for dashboard)
 @app.get("/signals/stats")
 def get_signal_stats(device_id: Optional[str] = None):
-    stat_columns = ["signal_type", "count", "avg_value", "min_value", "max_value"]
-    with get_db() as conn:
-        if device_id:
-            stats = conn.execute("""
-                SELECT
-                    signal_type,
-                    COUNT(*) as count,
-                    AVG(value) as avg_value,
-                    MIN(value) as min_value,
-                    MAX(value) as max_value
-                FROM signals
-                WHERE device_id = ?
-                GROUP BY signal_type
-            """, (device_id,)).fetchall()
-        else:
-            stats = conn.execute("""
-                SELECT
-                    signal_type,
-                    COUNT(*) as count,
-                    AVG(value) as avg_value,
-                    MIN(value) as min_value,
-                    MAX(value) as max_value
-                FROM signals
-                GROUP BY signal_type
-            """).fetchall()
-
-    return {"stats": rows_to_dicts(stats, stat_columns)}
+    if device_id:
+        result = execute_sql("""
+            SELECT
+                signal_type,
+                COUNT(*) as count,
+                AVG(value) as avg_value,
+                MIN(value) as min_value,
+                MAX(value) as max_value
+            FROM signals
+            WHERE device_id = ?
+            GROUP BY signal_type
+        """, [device_id])
+    else:
+        result = execute_sql("""
+            SELECT
+                signal_type,
+                COUNT(*) as count,
+                AVG(value) as avg_value,
+                MIN(value) as min_value,
+                MAX(value) as max_value
+            FROM signals
+            GROUP BY signal_type
+        """)
+    return {"stats": result_to_dicts(result)}
 
 
 # Clear all signals (for testing)
 @app.delete("/signals")
 def clear_signals():
-    with get_db() as conn:
-        conn.execute("DELETE FROM signals")
-        conn.commit()
+    execute_sql("DELETE FROM signals")
     return {"status": "cleared"}
 
 
