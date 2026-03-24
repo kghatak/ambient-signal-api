@@ -9,9 +9,9 @@ from datetime import datetime
 
 app = FastAPI(title="Ambient Signal API")
 
-# Turso database configuration
-TURSO_URL = os.getenv("TURSO_URL", "").strip()
-TURSO_AUTH_TOKEN = os.getenv("TURSO_AUTH_TOKEN", "").strip()
+# Turso database configuration (remove any whitespace/newlines from env vars)
+TURSO_URL = "".join(os.getenv("TURSO_URL", "").split())
+TURSO_AUTH_TOKEN = "".join(os.getenv("TURSO_AUTH_TOKEN", "").split())
 
 # Convert to HTTPS URL for HTTP API (Pipeline endpoint)
 BASE_URL = TURSO_URL.replace("libsql://", "https://") if TURSO_URL else ""
