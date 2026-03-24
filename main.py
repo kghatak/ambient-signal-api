@@ -2,8 +2,9 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from typing import Optional
-import libsql_client
+import httpx
 import os
+import json
 from datetime import datetime
 
 app = FastAPI(title="Ambient Signal API")
@@ -12,25 +13,37 @@ app = FastAPI(title="Ambient Signal API")
 TURSO_URL = os.getenv("TURSO_URL", "").strip()
 TURSO_AUTH_TOKEN = os.getenv("TURSO_AUTH_TOKEN", "").strip()
 
-# Build the database URL with auth token
-DB_URL = f"{TURSO_URL}?authToken={TURSO_AUTH_TOKEN}" if TURSO_URL else ""
-
-# Global client
-db_client = None
-
-
-def get_client():
-    global db_client
-    if db_client is None:
-        db_client = libsql_client.create_client_sync(url=TURSO_URL, auth_token=TURSO_AUTH_TOKEN)
-    return db_client
+# Convert to HTTPS URL for HTTP API
+HTTP_URL = TURSO_URL.replace("libsql://", "https://") if TURSO_URL else ""
 
 
 def execute_sql(sql, args=None):
-    client = get_client()
+    """Execute SQL via Turso HTTP API"""
+    if not HTTP_URL:
+        raise Exception("TURSO_URL not configured")
+
+    # Build the request
+    statements = [{"q": sql}]
     if args:
-        return client.execute(sql, args)
-    return client.execute(sql)
+        statements = [{"q": sql, "params": args}]
+
+    response = httpx.post(
+        HTTP_URL,
+        headers={
+            "Authorization": f"Bearer {TURSO_AUTH_TOKEN}",
+            "Content-Type": "application/json"
+        },
+        json={"statements": statements},
+        timeout=30.0
+    )
+
+    if response.status_code != 200:
+        raise Exception(f"Turso API error: {response.status_code} - {response.text}")
+
+    data = response.json()
+    if "results" in data and len(data["results"]) > 0:
+        return data["results"][0]
+    return {"columns": [], "rows": []}
 
 
 # Initialize database
@@ -115,8 +128,9 @@ def receive_batch_signals(batch: SignalBatch):
 
 # Helper to convert result set rows to dicts
 def result_to_dicts(result):
-    columns = [col[0] for col in result.columns]
-    return [dict(zip(columns, row)) for row in result.rows]
+    columns = result.get("columns", [])
+    rows = result.get("rows", [])
+    return [dict(zip(columns, row)) for row in rows]
 
 
 # Get recent signals
