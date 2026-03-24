@@ -13,11 +13,14 @@ app = FastAPI(title="Ambient Signal API")
 TURSO_URL = os.getenv("TURSO_URL", "")
 TURSO_AUTH_TOKEN = os.getenv("TURSO_AUTH_TOKEN", "")
 
+# Convert libsql:// to https:// for sync_url
+SYNC_URL = TURSO_URL.replace("libsql://", "https://") if TURSO_URL else ""
+
 
 # Database connection manager
 @contextmanager
 def get_db():
-    conn = libsql.connect("ambient-signals", sync_url=TURSO_URL, auth_token=TURSO_AUTH_TOKEN)
+    conn = libsql.connect("ambient-signals", sync_url=SYNC_URL, auth_token=TURSO_AUTH_TOKEN)
     conn.sync()
     try:
         yield conn
