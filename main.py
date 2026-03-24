@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from typing import Optional
 import sqlite3
@@ -174,3 +175,157 @@ def clear_signals():
         conn.execute("DELETE FROM signals")
         conn.commit()
     return {"status": "cleared"}
+
+
+# Dashboard HTML
+@app.get("/", response_class=HTMLResponse)
+def dashboard():
+    return """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ambient Signal Dashboard</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f172a; color: #e2e8f0; padding: 20px; }
+        h1 { text-align: center; margin-bottom: 20px; color: #38bdf8; }
+        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-bottom: 20px; }
+        .stat-card { background: #1e293b; padding: 20px; border-radius: 10px; text-align: center; }
+        .stat-card h3 { color: #94a3b8; font-size: 14px; text-transform: uppercase; }
+        .stat-card .value { font-size: 32px; font-weight: bold; color: #38bdf8; margin: 10px 0; }
+        .stat-card .meta { font-size: 12px; color: #64748b; }
+        .chart-container { background: #1e293b; padding: 20px; border-radius: 10px; margin-bottom: 20px; height: 300px; }
+        table { width: 100%; border-collapse: collapse; background: #1e293b; border-radius: 10px; overflow: hidden; }
+        th, td { padding: 12px 15px; text-align: left; border-bottom: 1px solid #334155; }
+        th { background: #334155; color: #38bdf8; font-weight: 600; }
+        tr:hover { background: #334155; }
+        .status { padding: 10px; text-align: center; color: #64748b; font-size: 14px; }
+        .refresh-info { text-align: center; margin-bottom: 15px; color: #64748b; font-size: 12px; }
+    </style>
+</head>
+<body>
+    <h1>Ambient Signal Dashboard</h1>
+    <p class="refresh-info">Auto-refreshes every 2 seconds</p>
+
+    <div class="stats-grid" id="stats-grid"></div>
+
+    <div class="chart-container">
+        <canvas id="chart"></canvas>
+    </div>
+
+    <table>
+        <thead>
+            <tr>
+                <th>ID</th>
+                <th>Timestamp</th>
+                <th>Device</th>
+                <th>Signal Type</th>
+                <th>Value</th>
+                <th>Unit</th>
+            </tr>
+        </thead>
+        <tbody id="table-body">
+            <tr><td colspan="6" class="status">Loading...</td></tr>
+        </tbody>
+    </table>
+
+    <script>
+        let chart = null;
+        const colors = ['#38bdf8', '#34d399', '#fbbf24', '#f87171', '#a78bfa', '#fb7185'];
+
+        async function fetchData() {
+            try {
+                const [signalsRes, statsRes] = await Promise.all([
+                    fetch('/signals?limit=50'),
+                    fetch('/signals/stats')
+                ]);
+                const signals = await signalsRes.json();
+                const stats = await statsRes.json();
+
+                updateStats(stats.stats);
+                updateTable(signals.signals);
+                updateChart(signals.signals);
+            } catch (e) {
+                console.error('Fetch error:', e);
+            }
+        }
+
+        function updateStats(stats) {
+            const grid = document.getElementById('stats-grid');
+            grid.innerHTML = stats.map((s, i) => `
+                <div class="stat-card">
+                    <h3>${s.signal_type}</h3>
+                    <div class="value" style="color: ${colors[i % colors.length]}">${s.avg_value.toFixed(1)}</div>
+                    <div class="meta">Min: ${s.min_value.toFixed(1)} | Max: ${s.max_value.toFixed(1)} | Count: ${s.count}</div>
+                </div>
+            `).join('');
+        }
+
+        function updateTable(signals) {
+            const tbody = document.getElementById('table-body');
+            if (signals.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="6" class="status">No data yet. Send some signals!</td></tr>';
+                return;
+            }
+            tbody.innerHTML = signals.map(s => `
+                <tr>
+                    <td>${s.id}</td>
+                    <td>${new Date(s.timestamp).toLocaleString()}</td>
+                    <td>${s.device_id}</td>
+                    <td>${s.signal_type}</td>
+                    <td>${s.value}</td>
+                    <td>${s.unit || '-'}</td>
+                </tr>
+            `).join('');
+        }
+
+        function updateChart(signals) {
+            const ctx = document.getElementById('chart').getContext('2d');
+
+            // Group by signal type
+            const grouped = {};
+            signals.reverse().forEach(s => {
+                if (!grouped[s.signal_type]) grouped[s.signal_type] = [];
+                grouped[s.signal_type].push({ x: new Date(s.timestamp), y: s.value });
+            });
+
+            const datasets = Object.entries(grouped).map(([type, data], i) => ({
+                label: type,
+                data: data,
+                borderColor: colors[i % colors.length],
+                backgroundColor: colors[i % colors.length] + '20',
+                tension: 0.3,
+                fill: false
+            }));
+
+            if (chart) {
+                chart.data.datasets = datasets;
+                chart.update('none');
+            } else {
+                chart = new Chart(ctx, {
+                    type: 'line',
+                    data: { datasets },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        scales: {
+                            x: { type: 'timeseries', time: { unit: 'minute' }, grid: { color: '#334155' }, ticks: { color: '#94a3b8' } },
+                            y: { grid: { color: '#334155' }, ticks: { color: '#94a3b8' } }
+                        },
+                        plugins: { legend: { labels: { color: '#e2e8f0' } } }
+                    }
+                });
+            }
+        }
+
+        // Initial fetch and auto-refresh
+        fetchData();
+        setInterval(fetchData, 2000);
+    </script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns"></script>
+</body>
+</html>
+"""
