@@ -2,21 +2,23 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from typing import Optional
-import sqlite3
-import json
+import libsql_experimental as libsql
+import os
 from datetime import datetime
 from contextlib import contextmanager
 
 app = FastAPI(title="Ambient Signal API")
 
-DATABASE = "signals.db"
+# Turso database configuration
+TURSO_URL = os.getenv("TURSO_URL", "")
+TURSO_AUTH_TOKEN = os.getenv("TURSO_AUTH_TOKEN", "")
 
 
 # Database connection manager
 @contextmanager
 def get_db():
-    conn = sqlite3.connect(DATABASE)
-    conn.row_factory = sqlite3.Row
+    conn = libsql.connect("ambient-signals", sync_url=TURSO_URL, auth_token=TURSO_AUTH_TOKEN)
+    conn.sync()
     try:
         yield conn
     finally:
@@ -116,9 +118,15 @@ def receive_batch_signals(batch: SignalBatch):
     }
 
 
+# Helper to convert rows to dicts
+def rows_to_dicts(rows, columns):
+    return [dict(zip(columns, row)) for row in rows]
+
+
 # Get recent signals
 @app.get("/signals")
 def get_signals(device_id: Optional[str] = None, limit: int = 100):
+    columns = ["id", "timestamp", "device_id", "signal_type", "value", "unit", "raw_data"]
     with get_db() as conn:
         if device_id:
             rows = conn.execute(
@@ -133,13 +141,14 @@ def get_signals(device_id: Optional[str] = None, limit: int = 100):
 
     return {
         "count": len(rows),
-        "signals": [dict(row) for row in rows]
+        "signals": rows_to_dicts(rows, columns)
     }
 
 
 # Get signal stats (for dashboard)
 @app.get("/signals/stats")
 def get_signal_stats(device_id: Optional[str] = None):
+    stat_columns = ["signal_type", "count", "avg_value", "min_value", "max_value"]
     with get_db() as conn:
         if device_id:
             stats = conn.execute("""
@@ -165,7 +174,7 @@ def get_signal_stats(device_id: Optional[str] = None):
                 GROUP BY signal_type
             """).fetchall()
 
-    return {"stats": [dict(row) for row in stats]}
+    return {"stats": rows_to_dicts(stats, stat_columns)}
 
 
 # Clear all signals (for testing)
