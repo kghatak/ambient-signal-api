@@ -13,27 +13,51 @@ app = FastAPI(title="Ambient Signal API")
 TURSO_URL = os.getenv("TURSO_URL", "").strip()
 TURSO_AUTH_TOKEN = os.getenv("TURSO_AUTH_TOKEN", "").strip()
 
-# Convert to HTTPS URL for HTTP API
-HTTP_URL = TURSO_URL.replace("libsql://", "https://") if TURSO_URL else ""
+# Convert to HTTPS URL for HTTP API (Pipeline endpoint)
+BASE_URL = TURSO_URL.replace("libsql://", "https://") if TURSO_URL else ""
+PIPELINE_URL = f"{BASE_URL}/v2/pipeline" if BASE_URL else ""
 
 
 def execute_sql(sql, args=None):
-    """Execute SQL via Turso HTTP API"""
-    if not HTTP_URL:
+    """Execute SQL via Turso HTTP Pipeline API"""
+    if not PIPELINE_URL:
         raise Exception("TURSO_URL not configured")
 
-    # Build the request
-    statements = [{"q": sql}]
+    # Build the pipeline request
     if args:
-        statements = [{"q": sql, "params": args}]
+        # Convert args to Turso format
+        turso_args = []
+        for arg in args:
+            if arg is None:
+                turso_args.append({"type": "null"})
+            elif isinstance(arg, int):
+                turso_args.append({"type": "integer", "value": str(arg)})
+            elif isinstance(arg, float):
+                turso_args.append({"type": "float", "value": arg})
+            else:
+                turso_args.append({"type": "text", "value": str(arg)})
+
+        request_body = {
+            "requests": [
+                {"type": "execute", "stmt": {"sql": sql, "args": turso_args}},
+                {"type": "close"}
+            ]
+        }
+    else:
+        request_body = {
+            "requests": [
+                {"type": "execute", "stmt": {"sql": sql}},
+                {"type": "close"}
+            ]
+        }
 
     response = httpx.post(
-        HTTP_URL,
+        PIPELINE_URL,
         headers={
             "Authorization": f"Bearer {TURSO_AUTH_TOKEN}",
             "Content-Type": "application/json"
         },
-        json={"statements": statements},
+        json=request_body,
         timeout=30.0
     )
 
@@ -41,8 +65,18 @@ def execute_sql(sql, args=None):
         raise Exception(f"Turso API error: {response.status_code} - {response.text}")
 
     data = response.json()
+
+    # Parse pipeline response
     if "results" in data and len(data["results"]) > 0:
-        return data["results"][0]
+        result = data["results"][0]
+        if "response" in result and "result" in result["response"]:
+            res = result["response"]["result"]
+            cols = [c["name"] for c in res.get("cols", [])]
+            rows = []
+            for row in res.get("rows", []):
+                rows.append([cell.get("value") for cell in row])
+            return {"columns": cols, "rows": rows}
+
     return {"columns": [], "rows": []}
 
 
